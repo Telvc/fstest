@@ -1,0 +1,132 @@
+---
+title: "fstest"
+output: html_document
+date: "2023-07-03"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Simulation
+
+```{r, warning=FALSE}
+#import library and set parameters
+
+library(MASS)
+library(EQL)
+library(e1071)
+library(ggplot2)
+library(gogarch)
+library(tmvtnorm)
+library(expm)
+rho = 0.99
+rho1 = 0.5
+#m = nrow(dat_mat)/2 #number of patients
+m = 10000
+p = 3 #number of features
+X = seq(0,50,1)/50
+K = length(X)
+alpha = 0.5
+beta = 0.5
+deca = matrix(rep(1,K*K),K,K)
+for(i in seq(K)){
+  for( j in seq(K)){
+    u = max(i,j)
+    v = min(i,j)
+    if (u<=2*K/3 & v>K/3) deca[i,j] = (K-u)/(K+1)
+    else deca[i,j] = 0.01
+  }
+}
+
+kernel = function(X, K, rho = rho){
+  sqdist = (matrix(rep(X,K),K,K)-t(matrix(rep(X,K),K,K)))^2
+  return(exp(-rho / (1-rho^2) * sqdist))
+}
+
+kernel_rq = function(X, K, rho = rho1,alpha = alpha){
+  sqdist = (matrix(rep(X,K),K,K)-t(matrix(rep(X,K),K,K)))^2
+  return((1+rho/(1-rho^2)/alpha*sqdist)^(-alpha))
+}
+kernel_per = function(X, K, rho = rho1,beta = beta){
+  sindist = sin(pi*abs(matrix(rep(X,K),K,K)-t(matrix(rep(X,K),K,K)))/beta)^2
+  return(exp(-2*sindist*rho/(1-rho^2)))
+}
+kernel_lpe = function(X, K, rho = rho1,beta = beta){
+  dist = 2*sin(pi*abs(matrix(rep(X,K),K,K)-t(matrix(rep(X,K),K,K)))/beta)^2+(matrix(rep(X,K),K,K)-t(matrix(rep(X,K),K,K)))^2/2
+  return(exp(-dist*rho/(1-rho^2)))
+}
+f = function(i,x){
+  r = rep(0,length(x))
+  N = 2^i*sqrt((1-rho)/(1+rho))*factorial(i)
+  for(j in seq(length(x))){
+    r[j] = exp(-rho/(1+rho)*x[j]^2)*hermite(x[j],i,prob = FALSE)/sqrt(N)
+  }
+  return(r)
+}
+
+mu = rep(0,K)
+cov = kernel(X, K, rho)
+cov_rq = kernel_rq(X,K,rho1,alpha)
+cov_per = kernel_per(X,K,rho1,beta)
+cov_lpe = kernel_lpe(X,K,rho1,beta)
+tsam = mvrnorm(m, mu, deca*cov)
+
+time = seq(0,1,1/(K-1))
+kernel_f = matrix(rep(0,p*K),p,K)
+for(i in seq(p)){
+  kernel_f[i,] = f(i-1,time)
+}
+
+eigen = c()
+for(i in seq(p)){
+  eigen = c(eigen, (1-rho)*rho**(i-1))
+}
+core_mat = diag(eigen)
+lambd = 10^(-5)
+
+km_cluster <- function(X) { 
+  km <- kmeans(X, 2, nstart=50)
+  return(km$cluster)
+}
+```
+
+```{r, warning = FALSE}
+seed = 140
+set.seed(seed)
+sig = 0.2
+n_curve = 1
+
+M = 100
+X = mvrnorm(M*m, rep(0,n_curve*K), cov_rq%x%diag(n_curve)) + sig*mvrnorm(M*m, rep(0,n_curve*K), diag(nrow(cov_rq%x%diag(n_curve))))
+X = array(c(X), dim = c(M*m,n_curve, K))
+
+pvalue = c()
+for(i in 1:M){
+  rectime = array(0, dim = c(m,n_curve, K))
+  for(j in 1:m){
+    for(k in 1:n_curve){
+      rectime[j,k,] = 1:K
+    }
+  }
+  input = array(c(X[(1+(i-1)*m):(i*m),,]), dim = c(m,n_curve,K))
+  pva = fspval(input, kernel = kernel, rho = 0.99, p = 3, cl_fun = km_cluster, rectime, toltime = 121, lambd = 1e-5, ndraws=1000, seed)
+  pvalue = c(pvalue, pva)
+  print(pva)
+}
+sort_p = sort(pvalue)
+x = 1:M/M
+x = 1:length(sort_p)/length(sort_p)
+linesize = 0.5
+pointsize = 2
+axisize = 30
+titsize = 30
+
+ggplot() + geom_point(aes(x,quantile(sort_p,x)), color = "blue") + geom_line(aes(x,x), color = "orange") + theme_bw() + xlab("Theoretical quantile") + ylab("Empirical quantile") + theme(title=element_text(size=titsize),axis.text.x=element_text(size=axisize),axis.text.y=element_text(size=axisize))
+```
+
+# Semi-syntheic simulation
+
+# Real data
+
+
