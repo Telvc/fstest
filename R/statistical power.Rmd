@@ -1,0 +1,604 @@
+---
+title: "statistical power"
+author: "Zihan Zhu"
+date: "2023-10-17"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Basic functions
+
+run all the functions
+
+```{r}
+library(amap)
+km_cluster <- function(X) { 
+  km <- Kmeans(X, 2, iter.max = 100, nstart=10)#,method = "manhattan")
+  return(km$cluster)
+}
+
+hi_cluster <- function(X, meth =  "ward.D") {
+  hc <- hclust(dist(X), meth)
+  return(cutree(hc, k = 2))
+}
+
+sd_cluster <- function(X) {
+  sd <- pam(X, 2)
+  return(sd$clustering)
+}
+```
+
+```{r}
+# function to compute the selective type I error
+
+test_clusters_approx_tensor <- function(X, k1, k2, iso=TRUE, sig=NULL, SigInv=NULL, ndraws=2000, cl_fun, cl=NULL) {
+  if(!is.matrix(X)) stop("X should be a matrix")
+  n <- nrow(X)
+  q <- ncol(X)
+  
+  if(is.null(cl)) cl <- cl_fun(X)
+  K <- length(unique(cl))
+  
+  if(!is_integer_between_a_b(K, 2, n)) stop("number of clusters (K) should be between 2 and n")
+  if(!is_integer_between_a_b(k1, 1, K) | !is_integer_between_a_b(k2, 1, K)) stop(paste("cluster indices should be between 1 and K", sep=""))
+  if((iso != TRUE) & (iso != FALSE)) stop("iso should be TRUE or FALSE")
+  
+  n1 <- sum(cl == k1)
+  n2 <- sum(cl == k2)
+  squared_norm_nu <- 1/n1 + 1/n2
+  diff_means <- colMeans(X[cl == k1, , drop=FALSE]) - colMeans(X[cl == k2, , drop=F])
+  
+  prop_k2 <- n2/(n1+n2)
+  
+  
+  if(iso) {
+    if(is.null(sig)) {
+      sig <- sqrt(sum(scale(X, scale=FALSE)^2)/(n*q - q))
+    }
+    
+    scale_factor <- squared_norm_nu*sig^2
+    # compute test statistic
+    stat <- norm_vec(diff_means)
+  } else {
+    if(is.null(SigInv)) {
+      Sig <- stats::cov(scale(X, scale=FALSE))
+      SigInv <- solve(Sig)
+    }
+
+    scale_factor <- squared_norm_nu
+    
+    # compute test statistic
+    stat <- sqrt(as.numeric(t(diff_means)%*%SigInv%*%diff_means))
+  }
+  
+  scale_factor <- sqrt(scale_factor)
+  phi <- stats::rnorm(ndraws)*scale_factor + stat
+  
+  
+  k1_constant <- prop_k2*diff_means/stat
+  k2_constant <- (prop_k2 - 1)*diff_means/stat
+  orig_k1 <- t(X[cl == k1, ])
+  orig_k2 <- t(X[cl == k2, ])
+  
+  Xphi <- X
+  
+  log_survives <- unlist(future.apply::future_lapply(X = 1:ndraws, FUN = function(j) {
+    if(phi[j] < 0) return(NA)
+    
+    # Compute perturbed data set
+    Xphi <- X
+    Xphi[cl == k1, ] <- t(orig_k1 + (phi[j] - stat)*k1_constant)
+    Xphi[cl == k2, ] <- t(orig_k2 + (phi[j] - stat)*k2_constant)
+    
+    # Recluster the perturbed data set
+    cl_Xphi <- cl_fun(Xphi)
+    if(preserve_cl(cl, cl_Xphi, k1, k2)) {
+      log_survives <- -(phi[j]/scale_factor)^2/2 + (q-1)*log(phi[j]/scale_factor) - (q/2 - 1)*log(2) - lgamma(q/2) - log(scale_factor) -
+        stats::dnorm(phi[j], mean=stat, sd=scale_factor, log=TRUE)
+      return(log_survives)
+    }
+    
+    return(NA)
+    
+  }, future.seed=TRUE))
+  
+  # Trim down to only survives
+  phi <- phi[!is.na(log_survives)]
+  log_survives <- log_survives[!is.na(log_survives)]
+  
+  survives <- length(log_survives)
+  
+  # Return nothing if nothing survives
+  if(survives == 0) {
+    warning("Oops - we didn't generate any samples that preserved the clusters! Try re-running with a larger value of ndraws.")
+    return(list(stat=stat, pval=NA, stderr=NA, clusters=cl))
+  }
+  
+  #  Approximate p-values
+  log_survives_shift <- log_survives - max(log_survives)
+  props <- exp(log_survives_shift)/sum(exp(log_survives_shift))
+  pval <- sum(props[phi >= stat])
+
+  var_pval <- (1 - pval)^2*sum(props[phi >= stat]^2) + pval^2*sum(props[phi < stat]^2)
+  
+  return(list(stat=stat, pval=pval, stderr=sqrt(var_pval), clusters=cl, n_survive = survives, phi = phi,prop = props,log_survive = log_survives))
+}
+
+```
+
+```{r}
+# ----- general purpose helper functions -----
+
+norm_vec <- function(x) {
+  sqrt(sum(x^2))
+}
+
+is_integer_between_a_b <- function(x, a, b) {
+  (x>= min(c(a, b))) && (x %% 1 == 0) && (x <= max(c(a, b)))
+}
+
+same_cl <- function(cl1, cl2, K) {
+  tab <- table(cl1, cl2)
+  sum(tab != 0) == K
+}
+
+preserve_cl <- function(cl, cl_phi, k1, k2) {
+  tab <- table(cl, cl_phi)
+  
+  k1_in <- (sum(tab[k1, ] != 0) == 1) & (sum(tab[, k1] != 0) == 1)
+  k2_in <- (sum(tab[k2, ] != 0) == 1) & (sum(tab[, k2] != 0) == 1)
+
+  k1_in & k2_in
+}
+```
+
+# set parameters
+
+```{r, warning=FALSE}
+#import library and set parameters
+library(cluster)
+library(MASS)
+library(EQL)
+library(e1071)
+library(ggplot2)
+library(gogarch)
+library(tmvtnorm)
+library(expm)
+library(matrixStats)
+library(matrixNormal)
+
+rho = 0.99#0.993
+lambd = 10^(-7)
+day = 7#14
+seed = 120
+T0 = 14
+
+#trun = 8
+
+rho1 = 0.5
+#m = nrow(dat_mat)/2 #number of patients
+m = 50000
+p = 3 #number of features
+X = seq(0,T0,1)/T0
+K = length(X)
+alpha = 0.5
+beta = 0.5
+deca = matrix(rep(1,K*K),K,K)
+for(i in seq(K)){
+  for( j in seq(K)){
+    u = max(i,j)
+    v = min(i,j)
+    if (u<=2*K/3 & v>K/3) deca[i,j] = (K-u)/(K+1)
+    else deca[i,j] = 0.01
+  }
+}
+
+kernel = function(X, rho = rho, K){
+  sqdist = (matrix(rep(X,K),K,K)-t(matrix(rep(X,K),K,K)))^2
+  return(exp(-rho / (1-rho^2) * sqdist))
+}
+
+kernel_rq = function(X1, X2, rho = rho1,alpha = alpha){
+  sqdist = (matrix(rep(X,K),K,K)-t(matrix(rep(X,K),K,K)))^2
+  return((1+rho/(1-rho^2)/alpha*sqdist)^(-alpha))
+}
+kernel_per = function(X1, X2, rho = rho1,beta = beta){
+  sindist = sin(pi*abs(matrix(rep(X,K),K,K)-t(matrix(rep(X,K),K,K)))/beta)^2
+  return(exp(-2*sindist*rho/(1-rho^2)))
+}
+kernel_lpe = function(X1, X2, rho = rho1,beta = beta){
+  dist = 2*sin(pi*abs(matrix(rep(X,K),K,K)-t(matrix(rep(X,K),K,K)))/beta)^2+(matrix(rep(X,K),K,K)-t(matrix(rep(X,K),K,K)))^2/2
+  return(exp(-dist*rho/(1-rho^2)))
+}
+f = function(i,x){
+  r = rep(0,length(x))
+  N = 2^i*sqrt((1-rho)/(1+rho))*factorial(i)
+  for(j in seq(length(x))){
+    r[j] = exp(-rho/(1+rho)*x[j]^2)*hermite(x[j],i,prob = FALSE)/sqrt(N)
+  }
+  return(r)
+}
+
+mu = rep(0,K)
+cov = kernel(X, rho, K)
+cov_rq = kernel_rq(X,X,rho1,alpha)
+cov_per = kernel_per(X,X,rho1,beta)
+cov_lpe = kernel_lpe(X,X,rho1,beta)
+tsam = mvrnorm(m, mu, deca*cov)
+
+time = seq(0,1,1/(K-1))
+kernel_f = matrix(rep(0,p*K),p,K)
+for(i in seq(p)){
+  kernel_f[i,] = f(i-1,time)
+}
+
+eigen = c()
+for(i in seq(p)){
+  eigen = c(eigen, (1-rho)*rho**(i-1))
+}
+core_mat = diag(eigen)
+```
+
+# plot of statistical power with respect to sample size
+
+```{r, warning = FALSE}
+library(sde)
+library(matrixStats)
+library(matrixNormal)
+set.seed(300)
+
+seed = 1
+power1 = c()
+power2 = c()
+
+for(i in c(5,10)){
+  m = 10*i
+n_curve = 1
+div = 10
+M = 100
+sigm = c(0.1) #seq(0,3,0.3)
+err1 = c()
+
+sample_cl1 = mvrnorm(m/2, rep(-div,n_curve*K), (deca*cov_lpe) %x%diag(n_curve)) + sig*mvrnorm(m/2, rep(0,n_curve*K), diag(nrow(cov_rq%x%diag(n_curve))))
+sample_cl2 = mvrnorm(m/2, rep(div,n_curve*K), (deca*cov_lpe) %x%diag(n_curve)) + sig*mvrnorm(m/2, rep(0,n_curve*K), diag(nrow(cov_rq%x%diag(n_curve))))
+sample_cl = rbind(sample_cl1,sample_cl2)
+sample_cl = array(c(sample_cl), dim = c(m,n_curve, K))
+
+coef = array(0, dim = c(m,n_curve, K))
+tol_sam = array(0, dim = c(m, n_curve, p))
+tol_vec = array(0, dim = c(m, n_curve* p))
+c_f_re = coef
+coe = solve(kernel_f%*%t(kernel_f)+lambd*diag(p))%*%kernel_f
+  
+err = 0
+  for(i in seq(m)){
+    tol_sam[i,,] = sample_cl[i,,]%*%t(coe)#coef[i,,]%*%mat1#t(kernel_f)%*%core_mat
+    tol_vec[i,] = array(tol_sam[i,,], dim = c(n_curve*p))
+    c_f_re[i,,] = tol_sam[i,,]%*%kernel_f
+  }
+  
+  whit = array(0, dim = c(m, n_curve,p))
+  sam_cov = solve(sqrtm(cov(tol_vec)))
+  for(i in seq(m)){
+    whit[i,,] = array(tol_vec[i,]%*%sam_cov, dim = c(n_curve,p))
+  }
+  
+  whit_vec = matrix(whit, m, n_curve*p)
+  cl0 = hi_cluster(whit_vec)
+  
+  for(o in 1:15){
+    set.seed(seed)
+    seed = seed+1
+for(sig in sigm){
+print(sig)
+type1err = 0
+countp = 0
+pval = c()
+whit_samp = array(0, dim = c(M,m,n_curve,p))
+unwhit_samp = whit_samp
+for(j in seq(M)){
+  
+  sample_cl1 = mvrnorm(m/2, rep(-div,n_curve*K), (deca*cov_lpe) %x%diag(n_curve)) + sig*mvrnorm(m/2, rep(0,n_curve*K), diag(nrow(cov_rq%x%diag(n_curve))))
+  sample_cl2 = mvrnorm(m/2, rep(div,n_curve*K), (deca*cov_lpe) %x%diag(n_curve)) + sig*mvrnorm(m/2, rep(0,n_curve*K), diag(nrow(cov_rq%x%diag(n_curve))))
+  sample_cl = rbind(sample_cl1,sample_cl2)
+  sample_cl = array(c(sample_cl), dim = c(m,n_curve, K))
+  
+  coef = array(0, dim = c(m,n_curve, K))
+  tol_sam = array(0, dim = c(m, n_curve, p))
+  tol_vec = array(0, dim = c(m, n_curve* p))
+  c_f_re = coef
+  coe = solve(kernel_f%*%t(kernel_f)+lambd*diag(p))%*%kernel_f
+  
+  err = 0
+  "for(i in 1:m){
+    for(k in 1:n_curve){
+      ind = which(!is.na(sample_cl[i,k,]))
+      cov_cur = cov[ind,ind]
+      inv1 = solve(cov_cur+lambd*diag(length(ind)))
+      coef_tr = sample_cl[i,k,ind]%*%inv1
+      tol_sam[i,k,] = coef_tr%*%mat1[ind,]
+      err = err+sum((coef_tr%*%cov_cur-sample_cl[i,k,ind])^2)/m
+    }
+    tol_vec[i,] = array(tol_sam[i,,], dim = c(n_curve*p))
+  }"
+  
+  for(i in seq(m)){
+    tol_sam[i,,] = sample_cl[i,,]%*%t(coe)#coef[i,,]%*%mat1#t(kernel_f)%*%core_mat
+    tol_vec[i,] = array(tol_sam[i,,], dim = c(n_curve*p))
+    c_f_re[i,,] = tol_sam[i,,]%*%kernel_f
+  }
+  
+  if(j == 1) print(err)
+  whit = array(0, dim = c(m, n_curve,p))
+  sam_cov = solve(sqrtm(cov(tol_vec)))
+  for(i in seq(m)){
+    whit[i,,] = array(tol_vec[i,]%*%sam_cov, dim = c(n_curve,p))
+  }
+  whit_samp[j,,,] = whit
+  unwhit_samp[j,,,] = tol_sam
+  
+  whit_vec = matrix(whit, m, n_curve*p)
+  cl = hi_cluster(whit_vec)
+  
+  if(all(cl == cl0)){
+  time = Sys.time()
+  pva = test_clusters_approx_tensor(whit_vec, k1=1, k2=2, cl_fun=hi_cluster, cl = cl, ndraws=1000)
+  pval = c(pval,pva$pval)
+  countp = countp+1
+  if(pva$pval<= 0.05) {
+    type1err = type1err + 1
+  }
+  }
+}
+err1 = c(err1,type1err/M)
+}
+print(type1err/countp)
+if(countp != 0) power1 = c(power1, type1err/countp)
+else power1 = c(power1, NA)
+  }
+}
+
+power1
+```
+```{r}
+pow1 = array(pow1,c(15,8))
+pow1
+
+sample_sizes <- seq(30, 100, length.out = ncol(pow1))
+
+# Calculating means and confidence intervals
+means <- apply(pow1, 2, mean)
+
+# Standard error assuming normal distribution; adjust if another distribution is implied
+std_error <- apply(pow1, 2, sd) / sqrt(nrow(pow1))
+
+# Confidence interval (95% used here)
+alpha <- 0.05
+error_margin <- qt(1 - alpha/2, df=nrow(pow1)-1) * std_error
+lower_bounds <- means - error_margin
+upper_bounds <- means + error_margin
+
+# Preparing data for ggplot
+plot_data <- data.frame(
+  SampleSize = sample_sizes,
+  Mean = means,
+  Lower = lower_bounds,
+  Upper = upper_bounds
+)
+
+linesize = 0.5
+pointsize = 2
+axisize = 30
+titsize = 30
+
+# Creating the plot
+ggplot(plot_data, aes(x = SampleSize, y = Mean)) +
+  geom_line(color = "blue",linewidth = 2) +
+  geom_point(color = "red") +
+  geom_errorbar(aes(ymin = Lower, ymax = Upper), width = 2, color = "black") +
+  labs(
+    x = "Sample Size",
+    y = "Statistical Power"
+  ) +
+  theme_bw()  + theme(title=element_text(size=titsize),axis.text.x=element_text(size=axisize),axis.text.y=element_text(size=axisize))
+
+ggsave(
+  filename = "C:/Users/11132/Downloads/Research/Duke/anru/selective inference/figure&data/statistical power/dis.pdf", 
+  width = 9,           
+  height = 6,         
+  units = "in",        
+  dpi = 1000
+)
+```
+
+
+# plot of statistical power with respect to cluster difference in means
+
+```{r, warning = FALSE}
+library(sde)
+library(matrixStats)
+library(matrixNormal)
+set.seed(120)
+
+seed = 1
+power3 = c()
+power4 = c()
+
+sampletimes = 30 #number of independent samples
+m = 60
+n_curve = 1
+M = 500
+sigm = c(0.1) #seq(0,3,0.3)
+sig = 0.1
+err1 = c()
+
+for(i in c(0.3)){
+div = i
+
+sample_cl1 = mvrnorm(m/2, rep(-div,n_curve*K), (deca*cov_lpe) %x%diag(n_curve)) + sig*mvrnorm(m/2, rep(0,n_curve*K), diag(nrow(cov_rq%x%diag(n_curve))))
+sample_cl2 = mvrnorm(m/2, rep(div,n_curve*K), (deca*cov_lpe) %x%diag(n_curve)) + sig*mvrnorm(m/2, rep(0,n_curve*K), diag(nrow(cov_rq%x%diag(n_curve))))
+sample_cl = rbind(sample_cl1,sample_cl2)
+sample_cl = array(c(sample_cl), dim = c(m,n_curve, K))
+
+coef = array(0, dim = c(m,n_curve, K))
+tol_sam = array(0, dim = c(m, n_curve, p))
+tol_vec = array(0, dim = c(m, n_curve* p))
+c_f_re = coef
+coe = solve(kernel_f%*%t(kernel_f)+lambd*diag(p))%*%kernel_f
+  
+err = 0
+  for(i in seq(m)){
+    tol_sam[i,,] = sample_cl[i,,]%*%t(coe)#coef[i,,]%*%mat1#t(kernel_f)%*%core_mat
+    tol_vec[i,] = array(tol_sam[i,,], dim = c(n_curve*p))
+    c_f_re[i,,] = tol_sam[i,,]%*%kernel_f
+  }
+  
+  whit = array(0, dim = c(m, n_curve,p))
+  sam_cov = solve(sqrtm(cov(tol_vec)))
+  for(i in seq(m)){
+    whit[i,,] = array(tol_vec[i,]%*%sam_cov, dim = c(n_curve,p))
+  }
+  
+  whit_vec = matrix(whit, m, n_curve*p)
+  cl0 = hi_cluster(whit_vec)
+  
+  for(o in 1:sampletimes){
+    #set.seed(seed)
+    #seed = seed+1
+type1err = 0
+countp = 0
+pval = c()
+whit_samp = array(0, dim = c(M,m,n_curve,p))
+unwhit_samp = whit_samp
+for(j in seq(M)){
+
+  sample_cl1 = mvrnorm(m/2, rep(-div,n_curve*K), (deca*cov_lpe) %x%diag(n_curve)) + sig*mvrnorm(m/2, rep(0,n_curve*K), diag(nrow(cov_rq%x%diag(n_curve))))
+  sample_cl2 = mvrnorm(m/2, rep(div,n_curve*K), (deca*cov_lpe) %x%diag(n_curve)) + sig*mvrnorm(m/2, rep(0,n_curve*K), diag(nrow(cov_rq%x%diag(n_curve))))
+  sample_cl = rbind(sample_cl1,sample_cl2)
+  sample_cl = array(c(sample_cl), dim = c(m,n_curve, K))
+  
+  coef = array(0, dim = c(m,n_curve, K))
+  tol_sam = array(0, dim = c(m, n_curve, p))
+  tol_vec = array(0, dim = c(m, n_curve* p))
+  c_f_re = coef
+  coe = solve(kernel_f%*%t(kernel_f)+lambd*diag(p))%*%kernel_f
+  
+  err = 0
+  "for(i in 1:m){
+    for(k in 1:n_curve){
+      ind = which(!is.na(sample_cl[i,k,]))
+      cov_cur = cov[ind,ind]
+      inv1 = solve(cov_cur+lambd*diag(length(ind)))
+      coef_tr = sample_cl[i,k,ind]%*%inv1
+      tol_sam[i,k,] = coef_tr%*%mat1[ind,]
+      err = err+sum((coef_tr%*%cov_cur-sample_cl[i,k,ind])^2)/m
+    }
+    tol_vec[i,] = array(tol_sam[i,,], dim = c(n_curve*p))
+  }"
+  
+  for(i in seq(m)){
+    tol_sam[i,,] = sample_cl[i,,]%*%t(coe)#coef[i,,]%*%mat1#t(kernel_f)%*%core_mat
+    tol_vec[i,] = array(tol_sam[i,,], dim = c(n_curve*p))
+    c_f_re[i,,] = tol_sam[i,,]%*%kernel_f
+  }
+  
+  whit = array(0, dim = c(m, n_curve,p))
+  sam_cov = solve(sqrtm(cov(tol_vec)))
+  for(i in seq(m)){
+    whit[i,,] = array(tol_vec[i,]%*%sam_cov, dim = c(n_curve,p))
+  }
+  whit_samp[j,,,] = whit
+  unwhit_samp[j,,,] = tol_sam
+  
+  whit_vec = matrix(whit, m, n_curve*p)
+  cl = hi_cluster(whit_vec)
+  
+  if(all(cl == cl0)){
+  time = Sys.time()
+  pva = test_clusters_approx_tensor(whit_vec, k1=1, k2=2, cl_fun=hi_cluster, cl = cl, ndraws=1000)
+  pval = c(pval,pva$pval)
+  countp = countp+1
+  if(pva$pval<= 0.05) {
+    type1err = type1err + 1
+  }
+  }
+}
+err1 = c(err1,type1err/M)
+
+print(countp)
+print(type1err/countp)
+if(countp != 0) power3 = c(power3, type1err/countp)
+else power3 = c(power3, NA)
+  }
+}
+
+power3
+
+seq(0.3,1.5,0.1)
+
+seq(0.3,1.2, length.out = ncol(pow2))
+```
+
+```{r}
+library(ggplot2)
+pow2 = stpower
+
+length(seq(0.3,1.5,0.1))
+array(power3,c(sampletimes,length(seq(0.3,1.3,0.1))))
+
+pow2 = array(power3,c(sampletimes,length(seq(0.3,1.5,0.1))))
+pow2[,7] = array(power3,c(15,1))
+
+pow1 = pow2
+pow2 = pow2[,-c(9,10)]
+pow2 = pow2[,-c(9)]
+
+sample_sizes <- seq(0.3,1, length.out = ncol(pow2))
+
+# Calculating means and confidence intervals
+means <- apply(pow2, 2, mean)
+
+# Standard error assuming normal distribution; adjust if another distribution is implied
+std_error <- apply(pow2, 2, sd) / sqrt(nrow(pow2))
+
+# Confidence interval (95% used here)
+alpha <- 0.05
+error_margin <- qt(1 - alpha/2, df=nrow(pow2)-1) * std_error
+lower_bounds <- means - error_margin
+upper_bounds <- means + error_margin
+
+# Preparing data for ggplot
+plot_data <- data.frame(
+  SampleSize = sample_sizes,
+  Mean = means,
+  Lower = lower_bounds,
+  Upper = upper_bounds
+)
+
+linesize = 0.5
+pointsize = 2
+axisize = 30
+titsize = 30
+
+# Creating the plot
+ggplot(plot_data, aes(x = SampleSize, y = Mean)) +
+  geom_line(color = "blue",linewidth = 2) +
+  geom_point(color = "red") +
+  geom_errorbar(aes(ymin = Lower, ymax = Upper),width = 0.02, color = "black") +
+  labs(
+    x = "Difference in Cluster Mean",
+    y = "Statistical Power"
+  ) +
+  theme_bw()  + theme(title=element_text(size=titsize),axis.text.x=element_text(size=axisize),axis.text.y=element_text(size=axisize))
+
+ggsave(
+  filename = "C:/Users/11132/Downloads/Research/Duke/anru/selective inference/figure&data/statistical power/dis.pdf", 
+  width = 9,           
+  height = 6,         
+  units = "in",        
+  dpi = 1000
+)
+```
